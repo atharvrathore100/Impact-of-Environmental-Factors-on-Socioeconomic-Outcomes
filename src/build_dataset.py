@@ -7,13 +7,18 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 import pandas as pd
+import numpy as np
 
 from data_processing import build_dataset
 from data_extraction import (
     load_country_shapes,
     extract_temperature,
     extract_population,
-    extract_gdp,
+    extract_gdp_timeseries,
+    extract_landcover_veg_fraction,
+    extract_deforestation_hazard,
+    extract_pm25_placeholder,
+    extract_precip_placeholder,
     load_lgii_excel,
 )
 
@@ -24,7 +29,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--lgii", required=True, help="Path to LGII Excel file")
     parser.add_argument(
-        "--keggal_dir", required=True, help="Path to Keggal data directory"
+        "--kaggle_dir", required=True, help="Path to Kaggle data directory"
     )
     parser.add_argument(
         "--out",
@@ -46,25 +51,34 @@ def main() -> None:
     shapes = load_country_shapes()
 
     print("Extracting environmental data...")
-    # Extract data into a DataFrame indexed by country ISO (if shapes has ISO)
-    # naturalearth_lowres has 'iso_a3'
-    
-    # Create environment DataFrame
-    env_df = pd.DataFrame(index=shapes.index)
-    env_df["country_iso"] = shapes["iso_a3"]
-    # We assume data is for a specific year or averaged. 
-    # LGII is panel data (year-country), but our static rasters are single-year (mostly).
-    # We will replicate the static env data for each year in LGII later or just merge.
-    # For now, let's create a static environment lookup.
-    
-    env_df["temp_celsius"] = extract_temperature(shapes, args.keggal_dir)
-    env_df["population"] = extract_population(shapes, args.keggal_dir)
-    env_df["gdp"] = extract_gdp(shapes, args.keggal_dir)
-    
-    # Drop rows with no ISO
-    env_df = env_df[env_df["country_iso"] != "-99"]
+    env_static = pd.DataFrame(index=shapes.index)
+    env_static["country_iso"] = shapes.index
+    env_static["temp_celsius"] = extract_temperature(shapes, args.kaggle_dir)
+    env_static["population"] = extract_population(shapes, args.kaggle_dir)
+    env_static["vegetation_fraction"] = extract_landcover_veg_fraction(
+        shapes, args.kaggle_dir
+    )
+    env_static["hazard_score"] = extract_deforestation_hazard(
+        shapes, args.kaggle_dir
+    )
+    env_static["pm25_mean"] = extract_pm25_placeholder(shapes)
+    env_static["precip_mm_month"] = extract_precip_placeholder(shapes)
 
-    dataset = build_dataset(lgii_df, env_df)
+    # Expand static variables across all LGII years
+    lgii_years = lgii_df["year"].dropna().astype(int).unique().tolist()
+    env_panel = pd.DataFrame(
+        {
+            "country_iso": np.repeat(env_static["country_iso"].values, len(lgii_years)),
+            "year": np.tile(lgii_years, len(env_static)),
+        }
+    ).merge(env_static, on="country_iso", how="left")
+
+    # Add GDP panel data where available
+    gdp_panel = extract_gdp_timeseries(shapes, args.kaggle_dir, lgii_years)
+    if not gdp_panel.empty:
+        env_panel = env_panel.merge(gdp_panel, on=["country_iso", "year"], how="left")
+
+    dataset = build_dataset(lgii_df, env_panel)
     dataset.to_csv(out_path, index=False)
     print(f"Saved merged dataset with {len(dataset)} rows to {out_path}")
 

@@ -10,6 +10,26 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import pandas as pd
 import seaborn as sns
+import geopandas as gpd
+
+
+def _load_country_shapes() -> gpd.GeoDataFrame:
+    url = "https://naturalearth.s3.amazonaws.com/110m_cultural/ne_110m_admin_0_countries.zip"
+    try:
+        world = gpd.read_file(url)
+    except Exception:
+        world = gpd.read_file(
+            "https://naciscdn.org/naturalearth/110m/cultural/ne_110m_admin_0_countries.zip"
+        )
+    iso_col = None
+    for candidate in ["iso_a3", "ISO_A3", "SOV_A3"]:
+        if candidate in world.columns:
+            iso_col = candidate
+            break
+    if iso_col is None:
+        raise ValueError("No ISO A3 column found in country shapes.")
+    world["iso_a3"] = world[iso_col].astype(str).str.upper()
+    return world[world["iso_a3"] != "-99"]
 
 
 def scatter_environment_vs_gini(df: pd.DataFrame, outdir: Path) -> None:
@@ -36,6 +56,27 @@ def timeseries_gini(df: pd.DataFrame, outdir: Path) -> None:
     plt.close(fig)
 
 
+def choropleth_csvi(df: pd.DataFrame, outdir: Path) -> None:
+    world = _load_country_shapes()[["iso_a3", "geometry"]]
+    latest = (
+        df.sort_values("year")
+        .groupby("country_iso")
+        .tail(1)
+        .rename(columns={"country_iso": "iso_a3"})
+    )
+    merged = world.merge(latest, on="iso_a3")
+    if merged.empty or "csvi" not in merged.columns:
+        return
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+    merged.plot(column="csvi", cmap="YlOrRd", legend=True, ax=ax, linewidth=0.2)
+    ax.set_axis_off()
+    ax.set_title("Climate–Socioeconomic Vulnerability Index (latest year)")
+    fig.tight_layout()
+    fig.savefig(outdir / "csvi_choropleth.png", dpi=250)
+    plt.close(fig)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Generate visualizations.")
     parser.add_argument("--data", required=True, help="Merged dataset CSV")
@@ -48,6 +89,7 @@ def main() -> None:
 
     scatter_environment_vs_gini(df, outdir)
     timeseries_gini(df, outdir)
+    choropleth_csvi(df, outdir)
     print(f"Wrote figures to {outdir}")
 
 

@@ -86,6 +86,10 @@ def add_indices(df: pd.DataFrame) -> pd.DataFrame:
     """Compute derived indices for stress and vulnerability."""
     out = df.copy()
 
+    # Map vegetation proxy to ndvi-like column for downstream use
+    if "vegetation_fraction" in out.columns and "ndvi_mean" not in out.columns:
+        out["ndvi_mean"] = out["vegetation_fraction"]
+
     # Handle missing columns by creating dummy Z-scores (0)
     def get_z(col_name):
         if col_name in out.columns and out[col_name].notna().any():
@@ -97,30 +101,32 @@ def add_indices(df: pd.DataFrame) -> pd.DataFrame:
         "z_hazard": get_z("hazard_score"),
         "z_temp": get_z("temp_celsius"),
         "z_ndvi": get_z("ndvi_mean"),
+        "z_precip": get_z("precip_mm_month"),
     }
     for name, values in components.items():
         out[name] = values
 
-    # Note: If we are missing NDVI, we subtract 0, which might not be ideal but is safe.
-    # If we are missing PM2.5, we add 0.
+    # Environmental stress index combines available factors.
     out["environmental_stress_index"] = (
-        out["z_pm25"] + out["z_hazard"] + out["z_temp"] - out["z_ndvi"]
+        out["z_pm25"]
+        + out["z_hazard"]
+        + out["z_temp"]
+        + out["z_precip"]
+        - out["z_ndvi"]
     )
 
     # Socioeconomic factors
-    # We might have 'population' and 'gdp' now instead of 'population_millions' etc.
-    # Let's map them if possible.
+    # Map alternative column names to expected ones
     if "population" in out.columns and "population_millions" not in out.columns:
         out["population_millions"] = out["population"] / 1e6
-        
-    # We don't have density or economic_openness easily calculated yet without area or trade data.
-    # We will just use what we have.
-    
+    if "gdp_ppp" in out.columns and "gdp" not in out.columns:
+        out["gdp"] = out["gdp_ppp"]
+
     socio_cols: Iterable[Tuple[str, float]] = [
         ("density_per_km2", 1.0),
         ("population_millions", 0.6),
         ("economic_openness", -0.8),
-        ("gdp", -0.5), # Added GDP as a factor since we have it
+        ("gdp", -0.5),
     ]
     socio_terms = []
     for col, sign in socio_cols:

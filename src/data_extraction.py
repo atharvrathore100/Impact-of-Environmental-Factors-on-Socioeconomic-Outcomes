@@ -1,11 +1,11 @@
 """
-Data extraction module to handle raw GeoTIFF and NetCDF files.
+Data extraction module to handle raw GeoTIFF and NetCDF files from the real Kaggle and NASA folders.
 """
 from __future__ import annotations
 
 import warnings
 from pathlib import Path
-from typing import Optional
+from typing import Iterable
 
 import geopandas as gpd
 import numpy as np
@@ -13,65 +13,64 @@ import pandas as pd
 import rasterio
 import rasterio.mask
 import xarray as xr
-from rasterio.io import DatasetReader
 from shapely.geometry import mapping
 
 
 def load_country_shapes() -> gpd.GeoDataFrame:
-    """Load country shapes using Natural Earth URL."""
+    """Load country shapes from Natural Earth (110m)."""
+    url = "https://naturalearth.s3.amazonaws.com/110m_cultural/ne_110m_admin_0_countries.zip"
     try:
-        # URL for Natural Earth 110m Cultural Vectors (Countries)
-        url = "https://naciscdn.org/naturalearth/110m/cultural/ne_110m_admin_0_countries.zip"
-        print(f"Downloading country shapes from {url}...")
         world = gpd.read_file(url)
-        
-        # Rename columns to match expected schema if needed (naturalearth_lowres had 'iso_a3', 'pop_est', 'name')
-        # The downloaded file usually has 'ISO_A3', 'POP_EST', 'NAME' or similar.
-        # Let's standardize column names to lowercase
-        world.columns = world.columns.str.lower()
-        
-        # Exclude Antarctica
-        if "pop_est" in world.columns:
-            world = world[(world["pop_est"] > 0) & (world["name"] != "Antarctica")]
-        
-        return world
-    except Exception as e:
-        print(f"Error loading country shapes: {e}")
-        raise
+    except Exception as exc:
+        warnings.warn(f"Falling back to local Natural Earth load due to: {exc}")
+        world = gpd.read_file("https://naciscdn.org/naturalearth/110m/cultural/ne_110m_admin_0_countries.zip")
+
+    iso_col = None
+    for candidate in ["iso_a3", "ISO_A3", "SOV_A3"]:
+        if candidate in world.columns:
+            iso_col = candidate
+            break
+    if iso_col is None:
+        raise ValueError("Could not find ISO A3 column in country shapes.")
+    world["iso_a3"] = world[iso_col].astype(str).str.upper()
+    world = world[world["iso_a3"].notna()]
+    world = world[world["iso_a3"] != "-99"]  # drop Antarctica / unknown
+    world = world.set_index(world["iso_a3"])
+    return world
 
 
 def _get_raster_stats(
-    shapes: gpd.GeoDataFrame, raster_path: Path | str, stat: str = "mean"
+    shapes: gpd.GeoDataFrame,
+    raster_path: Path | str,
+    stat: str = "mean",
+    band: int = 1,
 ) -> pd.Series:
     """Calculate zonal statistics for a raster against country shapes."""
     results = []
-    
     with rasterio.open(raster_path) as src:
-        # Reproject shapes to match raster CRS if needed
-        if str(src.crs) != str(shapes.crs):
-            shapes = shapes.to_crs(src.crs)
+        if band > src.count:
+            raise ValueError(f"Band {band} not available in {raster_path} (has {src.count})")
 
-        for _, row in shapes.iterrows():
+        shapes_aligned = shapes
+        if src.crs and str(src.crs) != str(shapes.crs):
+            shapes_aligned = shapes.to_crs(src.crs)
+
+        for _, row in shapes_aligned.iterrows():
             try:
                 geom = [mapping(row["geometry"])]
-                out_image, _ = rasterio.mask.mask(src, geom, crop=True)
-                # Mask nodata values
+                out_image, _ = rasterio.mask.mask(src, geom, crop=True, indexes=band)
                 data = out_image[0]
                 if src.nodata is not None:
                     data = np.ma.masked_equal(data, src.nodata)
-                
+
                 if stat == "mean":
                     val = np.mean(data)
                 elif stat == "sum":
                     val = np.sum(data)
                 else:
                     val = np.nan
-                
-                # Handle masked array result
-                if np.ma.is_masked(val):
-                    results.append(np.nan)
-                else:
-                    results.append(val)
+
+                results.append(val if not np.ma.is_masked(val) else np.nan)
             except Exception:
                 results.append(np.nan)
 
@@ -81,11 +80,10 @@ def _get_raster_stats(
 def extract_temperature(
     shapes: gpd.GeoDataFrame, data_dir: Path | str
 ) -> pd.Series:
-    """Extract mean temperature per country."""
+    """Extract mean long-term temperature per country."""
     base_path = Path(data_dir)
-    # Path found via exploration
     tif_path = base_path / "11_temperature/World_TEMP_GISdata_LTAy_GlobalSolarAtlas-v2_GEOTIFF/World_TEMP_GISdata_LTAy_GlobalSolarAtlas_GEOTIFF/TEMP.tif"
-    
+
     if not tif_path.exists():
         warnings.warn(f"Temperature file not found at {tif_path}")
         return pd.Series(np.nan, index=shapes.index)
@@ -97,75 +95,138 @@ def extract_temperature(
 def extract_population(
     shapes: gpd.GeoDataFrame, data_dir: Path | str
 ) -> pd.Series:
-    """Extract total population per country."""
+    """Extract total population per country (2015 raster, summed)."""
     base_path = Path(data_dir)
-    # Path found via exploration
     tif_path = base_path / "5_GHS_POP_E2015_GLOBE_R2019A_54009_250_V1_0/GHS_POP_E2015_GLOBE_R2019A_54009_250_V1_0/GHS_POP_E2015_GLOBE_R2019A_54009_250_V1_0.tif"
-    
+
     if not tif_path.exists():
         warnings.warn(f"Population file not found at {tif_path}")
         return pd.Series(np.nan, index=shapes.index)
 
     print("Extracting population data (this may take a while)...")
-    # Using 'sum' for population count
     return _get_raster_stats(shapes, tif_path, stat="sum")
 
 
-def extract_gdp(
-    shapes: gpd.GeoDataFrame, data_dir: Path | str
-) -> pd.Series:
-    """Extract GDP data from NetCDF."""
+def extract_gdp_timeseries(
+    shapes: gpd.GeoDataFrame, data_dir: Path | str, years: Iterable[int]
+) -> pd.DataFrame:
+    """
+    Extract GDP PPP per country for each requested year.
+    Uses the NetCDF file with 26 bands (1990-2015).
+    Returns a long dataframe with columns country_iso, year, gdp_ppp.
+    """
     base_path = Path(data_dir)
     nc_path = base_path / "6_GDP/doi_10.5061_dryad.dk1j0__v2/GDP_PPP_1990_2015_5arcmin_v2.nc"
-    
+
     if not nc_path.exists():
         warnings.warn(f"GDP file not found at {nc_path}")
-        return pd.Series(np.nan, index=shapes.index)
+        return pd.DataFrame(columns=["country_iso", "year", "gdp_ppp"])
 
-    print("Extracting GDP data...")
+    print("Extracting GDP data by year (1990-2015 bands)...")
     try:
         ds = xr.open_dataset(nc_path)
-        # Assuming the variable name is 'GDP_PPP' or similar, need to check or be robust
-        # Based on filename 'GDP_PPP_1990_2015_5arcmin_v2.nc', likely has a time dimension
-        # We'll take the latest year available (2015)
-        
-        # Inspect variable names if possible, but for now guess standard ones or first data var
-        var_name = list(ds.data_vars)[0]
-        data_2015 = ds[var_name].sel(time=2015, method="nearest")
-        
-        # This is a bit complex to zonal stat efficiently with xarray+geopandas without rasterio
-        # So we'll save a temporary tif or use a simplified point sampling if resolution is low
-        # Or just skip for now if too complex, but let's try a simple approach:
-        # Re-use rasterio if we can export to tif, or use regionmask if available (not in deps).
-        
-        # Alternative: just return NaNs for now if too hard without extra deps, 
-        # but let's try to be helpful.
-        # Actually, let's just use the population and temp for now as proof of concept
-        # and maybe skip GDP if it's too heavy, or try to read it.
-        
-        # For simplicity in this environment, let's skip complex NetCDF zonal stats 
-        # unless we really need it. We can use the CSV if we found one, but we didn't.
-        
+        available_years = [int(v) for v in ds["time"].values]
+    except Exception:
+        with rasterio.open(nc_path) as src:
+            available_years = list(range(1990, 1990 + src.count))
+
+    frames: list[pd.DataFrame] = []
+    with rasterio.open(nc_path) as src:
+        for year in sorted(set(int(y) for y in years if not pd.isna(y))):
+            if year not in available_years:
+                continue
+            band = available_years.index(year) + 1
+            stats = _get_raster_stats(shapes, nc_path, stat="sum", band=band)
+            frames.append(
+                pd.DataFrame(
+                    {
+                        "country_iso": shapes.index,
+                        "year": year,
+                        "gdp_ppp": stats.values,
+                    }
+                )
+            )
+
+    if not frames:
+        return pd.DataFrame(columns=["country_iso", "year", "gdp_ppp"])
+    return pd.concat(frames, ignore_index=True)
+
+
+def extract_landcover_veg_fraction(
+    shapes: gpd.GeoDataFrame, data_dir: Path | str
+) -> pd.Series:
+    """
+    Approximate vegetation cover share from ESA CCI land cover raster.
+    Returns fraction of vegetated pixels per country.
+    """
+    base_path = Path(data_dir)
+    tif_path = base_path / "7_Land_cover/ESACCI-LC-L4-LCCS-Map-300m-P1Y-2015-v2.0.7/product/ESACCI-LC-L4-LCCS-Map-300m-P1Y-2015-v2.0.7.tif"
+    if not tif_path.exists():
+        warnings.warn(f"Land cover file not found at {tif_path}")
         return pd.Series(np.nan, index=shapes.index)
 
-    except Exception as e:
-        print(f"Error extracting GDP: {e}")
+    print("Extracting vegetation cover fraction from land cover...")
+    results = []
+    with rasterio.open(tif_path) as src:
+        shapes_aligned = shapes
+        if src.crs and str(src.crs) != str(shapes.crs):
+            shapes_aligned = shapes.to_crs(src.crs)
+
+        def is_veg(arr):
+            return (arr >= 10) & (arr <= 200)  # broad vegetation class window
+
+        for _, row in shapes_aligned.iterrows():
+            try:
+                geom = [mapping(row["geometry"])]
+                out_image, _ = rasterio.mask.mask(src, geom, crop=True, indexes=1)
+                data = out_image[0]
+                valid = data[data > 0]
+                if valid.size == 0:
+                    results.append(np.nan)
+                    continue
+                frac = is_veg(valid).sum() / valid.size
+                results.append(frac)
+            except Exception:
+                results.append(np.nan)
+
+    return pd.Series(results, index=shapes.index)
+
+
+def extract_deforestation_hazard(
+    shapes: gpd.GeoDataFrame, data_dir: Path | str
+) -> pd.Series:
+    """
+    Use GFW deforestation classification as a proxy hazard score (mean value).
+    Higher values indicate more recent deforestation/pressure.
+    """
+    base_path = Path(data_dir)
+    tif_path = base_path / "8_GFW_deforestation/Goode_FinalClassification_19_05pcnt_prj/Goode_FinalClassification_19_05pcnt_prj.tif"
+    if not tif_path.exists():
+        warnings.warn(f"Deforestation file not found at {tif_path}")
         return pd.Series(np.nan, index=shapes.index)
+
+    print("Extracting deforestation-based hazard score...")
+    return _get_raster_stats(shapes, tif_path, stat="mean")
+
+
+def extract_pm25_placeholder(shapes: gpd.GeoDataFrame) -> pd.Series:
+    """No PM2.5 raster is present; return NaN with warning."""
+    warnings.warn("PM2.5 raster not found in Kaggle dataset; returning NaN.")
+    return pd.Series(np.nan, index=shapes.index)
+
+
+def extract_precip_placeholder(shapes: gpd.GeoDataFrame) -> pd.Series:
+    """No precipitation raster is present; return NaN with warning."""
+    warnings.warn("Precipitation raster not found in Kaggle dataset; returning NaN.")
+    return pd.Series(np.nan, index=shapes.index)
 
 
 def load_lgii_excel(path: Path | str) -> pd.DataFrame:
     """Load LGII data from Excel."""
     print(f"Loading LGII from {path}")
-    # Read the 'Data' sheet
     df = pd.read_excel(path, sheet_name="Data")
-    
-    # Standardize columns
-    # Rename 'ISO' to 'country_iso'
-    # Rename 'year' to 'year' (if needed, but usually it's lowercase or we normalize)
-    
-    # Normalize all columns to lowercase first to be safe
     df.columns = df.columns.str.lower()
-    
+
     rename_map = {
         "iso": "country_iso",
         "country": "country_iso",

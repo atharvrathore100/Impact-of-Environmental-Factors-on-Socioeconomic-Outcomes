@@ -12,8 +12,8 @@ This project operationalizes the proposal in `project 2 The A-team.pdf` by provi
 
 ### Setup
 ```bash
-python -m venv .venv
-.venv\\Scripts\\activate   # Windows
+python -m venv DPA
+DPA\\Scripts\\activate   # Windows
 pip install -r requirements.txt
 ```
 
