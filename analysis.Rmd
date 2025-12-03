@@ -1,0 +1,349 @@
+---
+title: "Climate–Socioeconomic Pipeline (R)"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(readxl)
+library(sf)
+library(terra)
+library(randomForest)
+
+theme_set(theme_minimal())
+```
+
+## Paths
+Update these if you relocated the raw downloads.
+
+```{r paths}
+lgii_default <- "data/Nasa Earth Data/spatialecon-lgii-measures-v1-xlsx.xlsx"
+lgii_fallback <- "data/sample/lgii_sample.csv"  # small toy file bundled in repo
+lgii_path <- if (file.exists(lgii_default)) lgii_default else lgii_fallback
+
+kaggle_dir <- "data/Kaggle Dataset"   # adjust if your folder is named differently (e.g., 'data/Kaggle Data')
+```
+
+## Helpers
+
+```{r helpers}
+standardize_iso <- function(x) toupper(trimws(as.character(x)))
+coerce_year <- function(x) suppressWarnings(as.integer(as.character(x)))
+
+zscore <- function(x) {
+  s <- sd(x, na.rm = TRUE)
+  m <- mean(x, na.rm = TRUE)
+  if (is.na(s) || s == 0) return(rep(0, length(x)))
+  (x - m) / s
+}
+
+minmax <- function(x) {
+  rng <- range(x, na.rm = TRUE)
+  if (diff(rng) == 0) return(rep(0, length(x)))
+  (x - rng[1]) / (diff(rng) + 1e-9)
+}
+```
+
+## Load LGII
+
+```{r load-lgii}
+if (!file.exists(lgii_path)) {
+  stop("LGII file not found. Checked: ", lgii_path, " and ", lgii_default, ". Place the NASA Excel there or set lgii_path manually.")
+}
+
+lgii <- if (grepl("\\.xlsx$", lgii_path, ignore.case = TRUE)) {
+  read_excel(lgii_path, sheet = "Data") %>%
+    janitor::clean_names() %>%
+    rename(country_iso = iso, gini = gini_weighted, .keep_all = TRUE)
+} else {
+  read_csv(lgii_path, show_col_types = FALSE) %>%
+    janitor::clean_names() %>%
+    mutate(gini = if ("gini" %in% names(.)) gini else NA_real_)
+}
+
+lgii <- lgii %>%
+  mutate(
+    country_iso = standardize_iso(country_iso),
+    year = coerce_year(year)
+  ) %>%
+  drop_na(country_iso, year)
+
+glimpse(lgii)
+```
+
+## Country Shapes (Natural Earth)
+
+```{r shapes}
+world <- rnaturalearth::ne_countries(scale = "medium", returnclass = "sf") %>%
+  mutate(country_iso = toupper(iso_a3)) %>%
+  filter(country_iso != "-99") %>%
+  select(country_iso, geometry)
+
+plot(st_geometry(world))
+```
+
+## Raster Extraction Utilities
+
+```{r raster-helpers}
+extract_stat <- function(shapes, raster_path, fun = mean, band = 1) {
+  if (!file.exists(raster_path)) {
+    warning("Missing raster: ", raster_path)
+    return(tibble(country_iso = shapes$country_iso, value = NA_real_))
+  }
+  r <- rast(raster_path)
+  if (band > nlyr(r)) stop("Band ", band, " not in raster.")
+  r <- r[[band]]
+  if (!is.na(crs(r)) && crs(r) != crs(shapes)) {
+    shapes <- st_transform(shapes, crs(r))
+  }
+  vals <- terra::extract(r, vect(shapes), fun = fun, na.rm = TRUE)[,2]
+  tibble(country_iso = shapes$country_iso, value = vals)
+}
+```
+
+## Environmental Features (Kaggle rasters)
+
+```{r env-extract}
+temp_path <- file.path(kaggle_dir, "11_temperature/World_TEMP_GISdata_LTAy_GlobalSolarAtlas-v2_GEOTIFF/World_TEMP_GISdata_LTAy_GlobalSolarAtlas_GEOTIFF/TEMP.tif")
+pop_path  <- file.path(kaggle_dir, "5_GHS_POP_E2015_GLOBE_R2019A_54009_250_V1_0/GHS_POP_E2015_GLOBE_R2019A_54009_250_V1_0/GHS_POP_E2015_GLOBE_R2019A_54009_250_V1_0.tif")
+veg_path  <- file.path(kaggle_dir, "7_Land_cover/ESACCI-LC-L4-LCCS-Map-300m-P1Y-2015-v2.0.7/product/ESACCI-LC-L4-LCCS-Map-300m-P1Y-2015-v2.0.7.tif")
+haz_path  <- file.path(kaggle_dir, "8_GFW_deforestation/Goode_FinalClassification_19_05pcnt_prj/Goode_FinalClassification_19_05pcnt_prj.tif")
+gdp_path  <- file.path(kaggle_dir, "6_GDP/doi_10.5061_dryad.dk1j0__v2/GDP_PPP_1990_2015_5arcmin_v2.nc")
+
+env_static <- world %>%
+  transmute(country_iso) %>%
+  left_join(extract_stat(world, temp_path, fun = mean) %>% rename(temp_celsius = value), by = "country_iso") %>%
+  left_join(extract_stat(world, pop_path, fun = sum) %>% rename(population = value), by = "country_iso") %>%
+  left_join({
+    if (file.exists(veg_path)) {
+      r <- rast(veg_path)
+      if (crs(r) != crs(world)) world_aligned <- st_transform(world, crs(r)) else world_aligned <- world
+      vals <- terra::extract(r, vect(world_aligned), na.rm = TRUE)[,-1]
+      # Vegetation fraction: proportion of pixels between 10 and 200
+      frac <- apply(vals, 1, function(v) {
+        v <- v[!is.na(v)]
+        if (length(v) == 0) return(NA_real_)
+        mean(v >= 10 & v <= 200)
+      })
+      tibble(country_iso = world$country_iso, vegetation_fraction = frac)
+    } else {
+      warning("Missing land cover raster: ", veg_path)
+      tibble(country_iso = world$country_iso, vegetation_fraction = NA_real_)
+    }
+  }, by = "country_iso") %>%
+  left_join(extract_stat(world, haz_path, fun = mean) %>% rename(hazard_score = value), by = "country_iso") %>%
+  mutate(
+    pm25_mean = NA_real_,             # placeholder
+    precip_mm_month = NA_real_        # placeholder
+  )
+
+# GDP panel (1990–2015 bands)
+gdp_panel <- {
+  if (file.exists(gdp_path)) {
+    r <- rast(gdp_path)
+    # Infer years from layer order
+    years <- 1990 + (seq_len(nlyr(r)) - 1)
+    map_dfr(seq_along(years), function(i) {
+      vals <- extract_stat(world, gdp_path, fun = sum, band = i) %>% rename(gdp_ppp = value)
+      vals$year <- years[i]
+      vals
+    })
+  } else {
+    warning("Missing GDP NetCDF: ", gdp_path)
+    tibble(country_iso = character(), year = integer(), gdp_ppp = numeric())
+  }
+}
+```
+
+## Build Panel Dataset
+
+```{r build}
+lgii_years <- sort(unique(lgii$year))
+
+env_panel <- expand_grid(country_iso = env_static$country_iso, year = lgii_years) %>%
+  left_join(env_static, by = "country_iso") %>%
+  left_join(gdp_panel, by = c("country_iso", "year"))
+
+data_merged <- lgii %>%
+  inner_join(env_panel, by = c("country_iso", "year"))
+
+data_enriched <- data_merged %>%
+  mutate(
+    ndvi_mean = vegetation_fraction,
+    z_pm25   = if_else(is.na(pm25_mean), 0, zscore(pm25_mean)),
+    z_hazard = if_else(is.na(hazard_score), 0, zscore(hazard_score)),
+    z_temp   = if_else(is.na(temp_celsius), 0, zscore(temp_celsius)),
+    z_ndvi   = if_else(is.na(ndvi_mean), 0, zscore(ndvi_mean)),
+    z_precip = if_else(is.na(precip_mm_month), 0, zscore(precip_mm_month)),
+    environmental_stress_index = z_pm25 + z_hazard + z_temp + z_precip - z_ndvi,
+    population_millions = if_else(!is.na(population), population / 1e6, population_millions),
+    gdp = gdp_ppp,
+    socioeconomic_vulnerability = coalesce(
+      zscore(density_per_km2), 0
+    ) + 0.6 * coalesce(zscore(population_millions), 0) +
+      (-0.8) * coalesce(zscore(economic_openness), 0) +
+      (-0.5) * coalesce(zscore(gdp), 0),
+    csvi = 0.6 * minmax(environmental_stress_index) + 0.4 * minmax(socioeconomic_vulnerability)
+  ) %>%
+  group_by(country_iso) %>%
+  arrange(year, .by_group = TRUE) %>%
+  mutate(delta_gini = gini - lag(gini)) %>%
+  ungroup()
+
+glimpse(data_enriched)
+```
+
+## Modeling
+
+```{r modeling}
+df_model <- data_enriched %>%
+  drop_na(gini)
+
+features <- c("pm25_mean","ndvi_mean","vegetation_fraction","temp_celsius",
+              "precip_mm_month","hazard_score","population_millions",
+              "density_per_km2","economic_openness","gdp_ppp",
+              "environmental_stress_index","socioeconomic_vulnerability")
+
+safe_impute <- function(v) {
+  med <- suppressWarnings(median(v, na.rm = TRUE))
+  if (is.na(med)) med <- 0
+  if_else(is.na(v), med, v)
+}
+
+X <- df_model %>%
+  select(any_of(features)) %>%
+  mutate(across(everything(), safe_impute))
+y <- df_model$gini
+
+# Train/test split
+set.seed(42)
+idx <- sample(seq_len(nrow(X)), size = ceiling(0.75 * nrow(X)))
+X_train <- X[idx, ]; X_test <- X[-idx, ]
+y_train <- y[idx];  y_test <- y[-idx]
+
+lin <- lm(y_train ~ ., data = X_train)
+lin_pred <- predict(lin, X_test)
+
+rf <- randomForest(x = X_train, y = y_train, ntree = 300, mtry = floor(sqrt(ncol(X_train))), nodesize = 2)
+rf_pred <- predict(rf, X_test)
+
+metrics <- function(truth, pred) {
+  tibble(
+    r2 = cor(truth, pred)^2,
+    mae = mean(abs(truth - pred)),
+    rmse = sqrt(mean((truth - pred)^2))
+  )
+}
+
+lin_metrics <- metrics(y_test, lin_pred)
+rf_metrics <- metrics(y_test, rf_pred)
+
+lin_metrics
+rf_metrics
+
+feature_importance <- tibble(
+  feature = colnames(rf$importance),
+  importance = as.numeric(rf$importance)
+) %>% arrange(desc(importance))
+
+head(feature_importance)
+```
+
+### Delta-Gini Models
+
+```{r delta}
+df_delta <- data_enriched %>% drop_na(delta_gini)
+if (nrow(df_delta) > 2) {
+  Xd <- df_delta %>%
+    select(any_of(features)) %>%
+    mutate(across(everything(), safe_impute))
+  yd <- df_delta$delta_gini
+  set.seed(42)
+  idxd <- sample(seq_len(nrow(Xd)), size = ceiling(0.75 * nrow(Xd)))
+  lin_d <- lm(yd[idxd] ~ ., data = Xd[idxd, ])
+  rf_d <- randomForest(x = Xd[idxd, ], y = yd[idxd], ntree = 200, nodesize = 2)
+  list(
+    delta_linear = metrics(yd[-idxd], predict(lin_d, Xd[-idxd, ])),
+    delta_rf = metrics(yd[-idxd], predict(rf_d, Xd[-idxd, ]))
+  )
+} else {
+  "Not enough observations with delta_gini to model."
+}
+```
+
+## Clustering Profiles
+
+```{r clustering}
+latest <- data_enriched %>%
+  group_by(country_iso) %>%
+  slice_tail(n = 1) %>%
+  ungroup()
+
+feat_cols <- intersect(c(features, "csvi"), colnames(latest))
+if (length(feat_cols) > 0 && nrow(latest) >= 2) {
+  mat <- latest %>%
+    select(all_of(feat_cols)) %>%
+    mutate(across(everything(), safe_impute)) %>%
+    as.matrix()
+  k <- min(4, nrow(mat))
+  if (k < 2) {
+    "Not enough rows to cluster."
+  } else {
+    km <- tryCatch(kmeans(mat, centers = k, nstart = 25), error = function(e) NULL)
+    if (is.null(km)) {
+      "Clustering failed (insufficient variation/rows)."
+    } else {
+      latest$cluster <- factor(km$cluster)
+      latest %>% select(country_iso, cluster)
+    }
+  }
+} else {
+  "Insufficient features/rows to cluster."
+}
+```
+
+## Visualizations
+
+```{r figures, fig.width=7, fig.height=5}
+# Scatter: stress vs. gini
+ggplot(data_enriched, aes(environmental_stress_index, gini)) +
+  geom_point(alpha = 0.7) +
+  geom_smooth(method = "lm", se = FALSE, color = "steelblue") +
+  labs(title = "Environmental Stress vs. Gini", x = "Environmental Stress Index", y = "Gini")
+```
+
+```{r timeseries, fig.width=9, fig.height=5}
+ggplot(data_enriched, aes(year, gini, color = country_iso)) +
+  geom_line() +
+  geom_point() +
+  labs(title = "Gini over Time", x = "Year", y = "Gini")
+```
+
+```{r choropleth, message=FALSE, warning=FALSE, fig.width=10, fig.height=6}
+latest_map <- latest %>% select(country_iso, csvi)
+world_csvi <- world %>% left_join(latest_map, by = "country_iso") %>% drop_na(csvi)
+
+if (nrow(world_csvi) > 0) {
+  ggplot(world_csvi) +
+    geom_sf(aes(fill = csvi), color = "gray30", size = 0.1) +
+    scale_fill_viridis_c(option = "C") +
+    labs(title = "Climate–Socioeconomic Vulnerability Index (latest year)", fill = "CSVI") +
+    theme(axis.text = element_blank(), axis.ticks = element_blank())
+}
+```
+
+## Save Outputs
+
+```{r save}
+dir.create("reports", showWarnings = FALSE, recursive = TRUE)
+write_csv(data_enriched, "reports/merged_dataset.csv")
+write_csv(feature_importance, "reports/feature_importance.csv")
+ggsave("reports/stress_vs_gini.png", width = 7, height = 5)
+ggsave("reports/gini_timeseries.png", width = 9, height = 5)
+```
+
+Knit this file to produce the merged dataset, model metrics, and figures analogous to the Python pipeline.
