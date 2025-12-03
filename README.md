@@ -26,14 +26,22 @@ sudo apt install -y python3 python3-venv python3-pip
 Then follow the same setup commands above (`python3 -m venv ...`).
 
 ### Running the pipeline with real datasets
-- **Environmental data**: Kaggle “Geospatial Environmental and Socioeconomic Data” (requires Kaggle CLI & API token). Download and aggregate rasters to country level (mean NDVI, PM2.5, temp, precipitation, hazard intensity). Save a country-year table with at least the columns used in `data/sample/environment_sample.csv`.
-- **LGII inequality data**: NASA SEDAC Light-based Geospatial Income Inequality (1992–2013). Export the country-year table with weighted Gini, population grids, density, and economic openness. Ensure ISO codes match the environmental file.
+The repository already contains the raw downloads required by the pipeline:
+- **LGII**: `data/Nasa Earth Data/spatialecon-lgii-measures-v1-xlsx.xlsx`.
+- **Environmental rasters/NetCDF**: `data/Kaggle Dataset/` (subfolders for temperature, GDP, land cover, deforestation, etc., matching the extractor paths in `src/data_extraction.py`).
 
-After preparing the real tables, point the scripts to them:
+The build script now defaults to these locations, so you only need to specify the desired output path:
 ```bash
-python3 src/build_dataset.py --lgii path/to/lgii.csv --environment path/to/environment.csv --out data/processed/merged.csv
+python3 src/build_dataset.py --out data/processed/merged.csv
 python3 src/modeling.py --data data/processed/merged.csv --outdir reports
 python3 src/visualize.py --data data/processed/merged.csv --outdir reports/figures
+```
+If you relocate any source data, override the defaults explicitly:
+```bash
+python3 src/build_dataset.py \
+  --lgii "/absolute/path/to/Nasa Earth Data/spatialecon-lgii-measures-v1-xlsx.xlsx" \
+  --kaggle_dir "/absolute/path/to/Kaggle Dataset" \
+  --out data/processed/merged.csv
 ```
 
 ### Notes on alignment and cleaning
