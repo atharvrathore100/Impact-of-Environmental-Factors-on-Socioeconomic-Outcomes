@@ -2,8 +2,8 @@
 title: "Climate–Socioeconomic Pipeline (R)"
 output:
   html_document:
-    toc: true
-    toc_depth: 2̥
+    toc: true̥
+    toc_depth: 2
     toc_float: true
 ---
 
@@ -14,10 +14,9 @@ library(sf)
 library(terra)
 library(randomForest)
 library(jsonlite)
-
 theme_set(theme_minimal())
 # Limit terra memory usage and spill to disk
-terraOptions(memfrac = 0.1, todisk = TRUE, parallel = FALSE)
+terraOptions(memfrac = 0.5, todisk = TRUE, parallel = FALSE)
 ```
 
 ## Paths
@@ -129,28 +128,53 @@ plot(st_geometry(world))
 ## Raster Extraction Utilities
 
 ```{r raster-helpers}
-extract_stat <- function(shapes, raster_path, fun = "mean", band = 1) {
+extract_stat <- function(shapes, raster_path, fun = "mean", band = 1,
+                         fact = 40,      # more aggressive downsampling
+                         use_zonal = TRUE) {
   if (!file.exists(raster_path)) {
     warning("Missing raster: ", raster_path)
     return(tibble(country_iso = shapes$country_iso, value = NA_real_))
   }
+
+  # Load single band only to avoid loading full stack
   r <- rast(raster_path)
   if (band > nlyr(r)) stop("Band ", band, " not in raster.")
   r <- r[[band]]
+
+  # Align CRS
   if (!is.na(crs(r)) && crs(r) != crs(shapes)) {
     shapes <- st_transform(shapes, crs(r))
   }
-  # Efficient zonal stats
+
+  # Crop early
+  r <- crop(r, vect(shapes))
+
+  # Heavy downsample to save RAM
+  r <- aggregate(
+    r, fact = fact, fun = mean, na.rm = TRUE,
+    filename = tempfile(fileext = ".tif"), overwrite = TRUE
+  )
+
   shapes$id <- seq_len(nrow(shapes))
-  z <- tryCatch(terra::zonal(r, vect(shapes), fun = fun, na.rm = TRUE), error = function(e) NULL)
-  if (is.null(z)) {
-    vals <- terra::extract(r, vect(shapes), fun = match.fun(fun), na.rm = TRUE)[,2]
-    return(tibble(country_iso = shapes$country_iso, value = vals))
+
+  if (use_zonal) {
+    z <- tryCatch(
+      terra::zonal(r, vect(shapes), fun = fun, na.rm = TRUE),
+      error = function(e) NULL
+    )
+    if (!is.null(z)) {
+      vals <- rep(NA_real_, nrow(shapes))
+      vals[match(z$zone, shapes$id)] <- z[[ncol(z)]]
+      return(tibble(country_iso = shapes$country_iso, value = vals))
+    }
   }
-  vals <- rep(NA_real_, nrow(shapes))
-  vals[match(z$zone, shapes$id)] <- z[[ncol(z)]]
+
+  ex <- terra::extract(r, vect(shapes), fun = match.fun(fun), na.rm = TRUE)
+  vals <- ex[, 2]
   tibble(country_iso = shapes$country_iso, value = vals)
 }
+
+
 ```
 
 ```{r}
@@ -201,15 +225,31 @@ if (is.na(pop_path)  || !file.exists(pop_path))  stop("Population raster not fou
 
 env_static <- world %>%
   transmute(country_iso) %>%
-  left_join(extract_stat(world, temp_path, fun = "mean") %>% rename(temp_celsius = value), by = "country_iso") %>%
-  left_join(extract_stat(world, pop_path, fun = "sum") %>% rename(population = value), by = "country_iso") %>%
+  left_join(
+    extract_stat(world, temp_path, fun = "mean", fact = 40) %>%
+      rename(temp_celsius = value),
+    by = "country_iso"
+  ) %>%
+  left_join(
+    extract_stat(world, pop_path, fun = "sum", fact = 60) %>%  # POP is huge
+      rename(population = value),
+    by = "country_iso"
+  ) %>%
   left_join({
     if (file.exists(veg_path)) {
       r <- rast(veg_path)
       if (crs(r) != crs(world)) world_aligned <- st_transform(world, crs(r)) else world_aligned <- world
       world_aligned$id <- seq_len(nrow(world_aligned))
-      # Reclassify to binary vegetation indicator (1 for 10–200)
-      r_veg <- classify(r, rbind(c(-Inf, 10, 0), c(10, 200, 1), c(200, Inf, 0)))
+
+      # downsample land cover before classifying to save RAM
+      r <- aggregate(r, fact = 40, fun = modal, na.rm = TRUE)
+
+      r_veg <- classify(
+        r,
+        rbind(c(-Inf, 10, 0),
+              c(10, 200, 1),
+              c(200, Inf, 0))
+      )
       z <- terra::zonal(r_veg, vect(world_aligned), fun = "mean", na.rm = TRUE)
       frac <- rep(NA_real_, nrow(world_aligned))
       frac[match(z$zone, world_aligned$id)] <- z$mean
@@ -219,11 +259,16 @@ env_static <- world %>%
       tibble(country_iso = world$country_iso, vegetation_fraction = NA_real_)
     }
   }, by = "country_iso") %>%
-  left_join(extract_stat(world, haz_path, fun = mean) %>% rename(hazard_score = value), by = "country_iso") %>%
+  left_join(
+    extract_stat(world, haz_path, fun = "mean", fact = 40) %>%
+      rename(hazard_score = value),
+    by = "country_iso"
+  ) %>%
   mutate(
-    pm25_mean = NA_real_,             # placeholder
-    precip_mm_month = NA_real_        # placeholder
+    pm25_mean = NA_real_,
+    precip_mm_month = NA_real_
   )
+
 
 # GDP panel (1990–2015 bands)
 gdp_panel <- {
@@ -347,7 +392,7 @@ head(feature_importance)
 
 ```{r delta}
 df_delta <- data_enriched %>% drop_na(delta_gini)
-if (nrow(df_delta) > 2) {
+delta_results <- if (nrow(df_delta) > 2) {
   Xd <- df_delta %>%
     select(any_of(features)) %>%
     mutate(across(everything(), safe_impute))
