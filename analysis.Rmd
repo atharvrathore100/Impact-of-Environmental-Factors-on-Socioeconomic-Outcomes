@@ -1,7 +1,7 @@
 ---
 title: "Climate–Socioeconomic Pipeline (R)"
 output:
-  html_document:
+  html_document:̥
     toc: true̥
     toc_depth: 2
     toc_float: true
@@ -222,7 +222,9 @@ cat("Resolved gdp_path :", gdp_path,  "exists:", file.exists(gdp_path),  "\n")
 
 if (is.na(temp_path) || !file.exists(temp_path)) stop("Temperature raster not found or unreadable; ensure TEMP.tif exists and the path is accessible.")
 if (is.na(pop_path)  || !file.exists(pop_path))  stop("Population raster not found or unreadable; ensure GHS_POP...tif exists and the path is accessible.")
+```
 
+```{r env-extract}
 env_static <- world %>%
   transmute(country_iso) %>%
   left_join(
@@ -238,11 +240,11 @@ env_static <- world %>%
   left_join({
     if (file.exists(veg_path)) {
       r <- rast(veg_path)
-      if (crs(r) != crs(world)) world_aligned <- st_transform(world, crs(r)) else world_aligned <- world
+      if (crs(r) != crs(world)) world_aligned <- st_transform(world, ̥crs(r)) else world_aligned <- world
       world_aligned$id <- seq_len(nrow(world_aligned))
 
       # downsample land cover before classifying to save RAM
-      r <- aggregate(r, fact = 40, fun = modal, na.rm = TRUE)
+      r <- aggregate(r, fact = 40, fun = median, na.rm = TRUE)
 
       r_veg <- classify(
         r,
@@ -315,19 +317,25 @@ data_enriched <- data_merged %>%
     z_ndvi   = if_else(is.na(ndvi_mean), 0, zscore(ndvi_mean)),
     z_precip = if_else(is.na(precip_mm_month), 0, zscore(precip_mm_month)),
     environmental_stress_index = z_pm25 + z_hazard + z_temp + z_precip - z_ndvi,
-    population_millions = if_else(!is.na(population), population / 1e6, population_millions),
+
+    population_millions = population / 1e6,
     gdp = gdp_ppp,
-    socioeconomic_vulnerability = coalesce(
-      zscore(density_per_km2), 0
-    ) + 0.6 * coalesce(zscore(population_millions), 0) +
-      (-0.8) * coalesce(zscore(economic_openness), 0) +
+
+    socioeconomic_vulnerability =
+      coalesce(zscore(pdens), 0) +
+      0.6 * coalesce(zscore(population_millions), 0) +
+      (-0.8) * coalesce(zscore(kaopen), 0) +
       (-0.5) * coalesce(zscore(gdp), 0),
-    csvi = 0.6 * minmax(environmental_stress_index) + 0.4 * minmax(socioeconomic_vulnerability)
+
+    csvi = 0.6 * minmax(environmental_stress_index) +
+           0.4 * minmax(socioeconomic_vulnerability)
   ) %>%
   group_by(country_iso) %>%
   arrange(year, .by_group = TRUE) %>%
   mutate(delta_gini = gini - lag(gini)) %>%
   ungroup()
+
+
 
 glimpse(data_enriched)
 ```
