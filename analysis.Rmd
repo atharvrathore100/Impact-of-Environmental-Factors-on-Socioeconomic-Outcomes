@@ -3,7 +3,7 @@ title: "Climate–Socioeconomic Pipeline (R)"
 output:
   html_document:
     toc: true
-    toc_depth: 2
+    toc_depth: 2̥
     toc_float: true
 ---
 
@@ -13,19 +13,38 @@ library(readxl)
 library(sf)
 library(terra)
 library(randomForest)
+library(jsonlite)
 
 theme_set(theme_minimal())
+# Limit terra memory usage and spill to disk
+terraOptions(memfrac = 0.1, todisk = TRUE, parallel = FALSE)
 ```
 
 ## Paths
 Update these if you relocated the raw downloads.
 
 ```{r paths}
-lgii_default <- "data/Nasa Earth Data/spatialecon-lgii-measures-v1-xlsx.xlsx"
-lgii_fallback <- "data/sample/lgii_sample.csv"  # small toy file bundled in repo
-lgii_path <- if (file.exists(lgii_default)) lgii_default else lgii_fallback
+# Set this to your Windows project root (adjust if your drive/folder differs)
+windows_root <- "D:/IIT Sem3/Data Preparation and Analysis CSP-571/All project/Impact-of-Environmental-Factors-on-Socioeconomic-Outcomes"
 
-kaggle_dir <- "data/Kaggle Dataset"   # adjust if your folder is named differently (e.g., 'data/Kaggle Data')
+lgii_default <- file.path(windows_root, "data", "Nasa Earth Data", "spatialecon-lgii-measures-v1-xlsx.xlsx")
+lgii_sample <- file.path(windows_root, "data", "sample", "lgii_sample.csv")  # set use_sample_lgii <- TRUE only if testing
+use_sample_lgii <- FALSE
+
+kaggle_dir <- file.path(windows_root, "data", "Kaggle Dataset")   # adjust if your folder is named differently (e.g., 'data/Kaggle Data')
+
+if (file.exists(lgii_default)) {
+  lgii_path <- lgii_default
+} else if (use_sample_lgii && file.exists(lgii_sample)) {
+  lgii_path <- lgii_sample
+} else {
+  stop("LGII Excel not found at ", lgii_default, ". Set the correct path or enable use_sample_lgii for the toy CSV.")
+}
+
+lgii_path <- normalizePath(lgii_path, winslash = "/", mustWork = TRUE)
+kaggle_dir <- normalizePath(kaggle_dir, winslash = "/", mustWork = TRUE)
+cat("Using LGII at:", lgii_path, "\n")
+cat("Using Kaggle data at:", kaggle_dir, "\n")
 ```
 
 ## Helpers
@@ -46,6 +65,16 @@ minmax <- function(x) {
   if (diff(rng) == 0) return(rep(0, length(x)))
   (x - rng[1]) / (diff(rng) + 1e-9)
 }
+
+to_unc <- function(p) {
+  if (is.na(p)) return(NA_character_)
+  paste0("\\\\?\\", normalizePath(p, winslash = "\\", mustWork = FALSE))
+}
+
+find_file <- function(base_dir, pattern) {
+  hits <- list.files(base_dir, pattern = pattern, recursive = TRUE, full.names = TRUE)
+  if (length(hits) > 0) normalizePath(hits[[1]], winslash = "/", mustWork = FALSE) else NA_character_
+}
 ```
 
 ## Load LGII
@@ -56,18 +85,29 @@ if (!file.exists(lgii_path)) {
 }
 
 lgii <- if (grepl("\\.xlsx$", lgii_path, ignore.case = TRUE)) {
-  read_excel(lgii_path, sheet = "Data") %>%
-    janitor::clean_names() %>%
-    rename(country_iso = iso, gini = gini_weighted, .keep_all = TRUE)
+  lg_raw <- read_excel(lgii_path, sheet = "Data") %>%
+    janitor::clean_names()
+  country_col <- intersect(c("iso", "country_iso", "country"), names(lg_raw))
+  country_col <- if (length(country_col) > 0) country_col[[1]] else NA_character_
+  gini_col <- intersect(c("gini_weighted", "gini"), names(lg_raw))
+  gini_col <- if (length(gini_col) > 0) gini_col[[1]] else NA_character_
+  if (is.na(country_col)) stop("Could not find a country/iso column in LGII.")
+  lg_raw %>%
+    mutate(
+      country_iso = standardize_iso(.data[[country_col]]),
+      gini = if (!is.na(gini_col)) .data[[gini_col]] else NA_real_
+    )
 } else {
   read_csv(lgii_path, show_col_types = FALSE) %>%
     janitor::clean_names() %>%
-    mutate(gini = if ("gini" %in% names(.)) gini else NA_real_)
+    mutate(
+      country_iso = standardize_iso(coalesce(country_iso, iso, country)),
+      gini = if ("gini" %in% names(.)) gini else NA_real_
+    )
 }
 
 lgii <- lgii %>%
   mutate(
-    country_iso = standardize_iso(country_iso),
     year = coerce_year(year)
   ) %>%
   drop_na(country_iso, year)
@@ -89,7 +129,7 @@ plot(st_geometry(world))
 ## Raster Extraction Utilities
 
 ```{r raster-helpers}
-extract_stat <- function(shapes, raster_path, fun = mean, band = 1) {
+extract_stat <- function(shapes, raster_path, fun = "mean", band = 1) {
   if (!file.exists(raster_path)) {
     warning("Missing raster: ", raster_path)
     return(tibble(country_iso = shapes$country_iso, value = NA_real_))
@@ -100,36 +140,80 @@ extract_stat <- function(shapes, raster_path, fun = mean, band = 1) {
   if (!is.na(crs(r)) && crs(r) != crs(shapes)) {
     shapes <- st_transform(shapes, crs(r))
   }
-  vals <- terra::extract(r, vect(shapes), fun = fun, na.rm = TRUE)[,2]
+  # Efficient zonal stats
+  shapes$id <- seq_len(nrow(shapes))
+  z <- tryCatch(terra::zonal(r, vect(shapes), fun = fun, na.rm = TRUE), error = function(e) NULL)
+  if (is.null(z)) {
+    vals <- terra::extract(r, vect(shapes), fun = match.fun(fun), na.rm = TRUE)[,2]
+    return(tibble(country_iso = shapes$country_iso, value = vals))
+  }
+  vals <- rep(NA_real_, nrow(shapes))
+  vals[match(z$zone, shapes$id)] <- z[[ncol(z)]]
   tibble(country_iso = shapes$country_iso, value = vals)
 }
 ```
 
+```{r}
+temp_path <- "data/Kaggle Dataset/11_temperature/World_TEMP_GISdata_LTAy_GlobalSolarAtlas-v2_GEOTIFF/World_TEMP_GISdata_LTAy_GlobalSolarAtlas_GEOTIFF/TEMP.tif"
+print(temp_path)
+file.exists(temp_path)
+```
+
+
 ## Environmental Features (Kaggle rasters)
 
 ```{r env-extract}
-temp_path <- file.path(kaggle_dir, "11_temperature/World_TEMP_GISdata_LTAy_GlobalSolarAtlas-v2_GEOTIFF/World_TEMP_GISdata_LTAy_GlobalSolarAtlas_GEOTIFF/TEMP.tif")
-pop_path  <- file.path(kaggle_dir, "5_GHS_POP_E2015_GLOBE_R2019A_54009_250_V1_0/GHS_POP_E2015_GLOBE_R2019A_54009_250_V1_0/GHS_POP_E2015_GLOBE_R2019A_54009_250_V1_0.tif")
-veg_path  <- file.path(kaggle_dir, "7_Land_cover/ESACCI-LC-L4-LCCS-Map-300m-P1Y-2015-v2.0.7/product/ESACCI-LC-L4-LCCS-Map-300m-P1Y-2015-v2.0.7.tif")
-haz_path  <- file.path(kaggle_dir, "8_GFW_deforestation/Goode_FinalClassification_19_05pcnt_prj/Goode_FinalClassification_19_05pcnt_prj.tif")
-gdp_path  <- file.path(kaggle_dir, "6_GDP/doi_10.5061_dryad.dk1j0__v2/GDP_PPP_1990_2015_5arcmin_v2.nc")
+list_and_normalize <- function(dir, pattern, label) {
+  hits <- list.files(dir, pattern = pattern, recursive = TRUE, full.names = TRUE)
+  cat(label, "candidates found:", length(hits), "\n")
+  if (length(hits) == 0) return(NA_character_)
+  first <- hits[1]
+  cat(paste0("  [1] ", first, "\n"))
+  to_unc(first)
+}
+
+temp_path <- list_and_normalize(kaggle_dir, "TEMP.tif$", "TEMP")
+pop_path  <- list_and_normalize(kaggle_dir, "GHS_POP_E2015_GLOBE_R2019A_54009_250_V1_0\\.tif$", "POP")
+veg_path  <- list_and_normalize(kaggle_dir, "ESACCI-LC-L4-LCCS-Map-300m-P1Y-2015-v2\\.0\\.7\\.tif$", "VEG")
+haz_path  <- list_and_normalize(kaggle_dir, "Goode_FinalClassification_19_05pcnt_prj\\.tif$", "HAZ")
+gdp_path  <- list_and_normalize(kaggle_dir, "GDP_PPP_1990_2015_5arcmin_v2\\.nc$", "GDP")
+
+# Explicit override for temperature path if auto-discovery fails (UNC Windows path)
+if (is.na(temp_path) || !file.exists(temp_path)) {
+  temp_path <- to_unc(
+    file.path(
+      windows_root, "data", "Kaggle Dataset", "11_temperature",
+      "World_TEMP_GISdata_LTAy_GlobalSolarAtlas-v2_GEOTIFF",
+      "World_TEMP_GISdata_LTAy_GlobalSolarAtlas_GEOTIFF",
+      "TEMP.tif"
+    )
+  )
+}
+
+cat("Resolved temp_path:", temp_path, "exists:", file.exists(temp_path), "\n")
+cat("Resolved pop_path :", pop_path,  "exists:", file.exists(pop_path),  "\n")
+cat("Resolved veg_path :", veg_path,  "exists:", file.exists(veg_path),  "\n")
+cat("Resolved haz_path :", haz_path,  "exists:", file.exists(haz_path),  "\n")
+cat("Resolved gdp_path :", gdp_path,  "exists:", file.exists(gdp_path),  "\n")
+
+if (is.na(temp_path) || !file.exists(temp_path)) stop("Temperature raster not found or unreadable; ensure TEMP.tif exists and the path is accessible.")
+if (is.na(pop_path)  || !file.exists(pop_path))  stop("Population raster not found or unreadable; ensure GHS_POP...tif exists and the path is accessible.")
 
 env_static <- world %>%
   transmute(country_iso) %>%
-  left_join(extract_stat(world, temp_path, fun = mean) %>% rename(temp_celsius = value), by = "country_iso") %>%
-  left_join(extract_stat(world, pop_path, fun = sum) %>% rename(population = value), by = "country_iso") %>%
+  left_join(extract_stat(world, temp_path, fun = "mean") %>% rename(temp_celsius = value), by = "country_iso") %>%
+  left_join(extract_stat(world, pop_path, fun = "sum") %>% rename(population = value), by = "country_iso") %>%
   left_join({
     if (file.exists(veg_path)) {
       r <- rast(veg_path)
       if (crs(r) != crs(world)) world_aligned <- st_transform(world, crs(r)) else world_aligned <- world
-      vals <- terra::extract(r, vect(world_aligned), na.rm = TRUE)[,-1]
-      # Vegetation fraction: proportion of pixels between 10 and 200
-      frac <- apply(vals, 1, function(v) {
-        v <- v[!is.na(v)]
-        if (length(v) == 0) return(NA_real_)
-        mean(v >= 10 & v <= 200)
-      })
-      tibble(country_iso = world$country_iso, vegetation_fraction = frac)
+      world_aligned$id <- seq_len(nrow(world_aligned))
+      # Reclassify to binary vegetation indicator (1 for 10–200)
+      r_veg <- classify(r, rbind(c(-Inf, 10, 0), c(10, 200, 1), c(200, Inf, 0)))
+      z <- terra::zonal(r_veg, vect(world_aligned), fun = "mean", na.rm = TRUE)
+      frac <- rep(NA_real_, nrow(world_aligned))
+      frac[match(z$zone, world_aligned$id)] <- z$mean
+      tibble(country_iso = world_aligned$country_iso, vegetation_fraction = frac)
     } else {
       warning("Missing land cover raster: ", veg_path)
       tibble(country_iso = world$country_iso, vegetation_fraction = NA_real_)
@@ -157,6 +241,12 @@ gdp_panel <- {
     tibble(country_iso = character(), year = integer(), gdp_ppp = numeric())
   }
 }
+```
+
+```{r}
+print(temp_path)
+file.exists(temp_path)
+
 ```
 
 ## Build Panel Dataset
@@ -266,13 +356,26 @@ if (nrow(df_delta) > 2) {
   idxd <- sample(seq_len(nrow(Xd)), size = ceiling(0.75 * nrow(Xd)))
   lin_d <- lm(yd[idxd] ~ ., data = Xd[idxd, ])
   rf_d <- randomForest(x = Xd[idxd, ], y = yd[idxd], ntree = 200, nodesize = 2)
-  list(
-    delta_linear = metrics(yd[-idxd], predict(lin_d, Xd[-idxd, ])),
-    delta_rf = metrics(yd[-idxd], predict(rf_d, Xd[-idxd, ]))
+  tibble(
+    model = c("delta_linear", "delta_random_forest"),
+    r2 = c(metrics(yd[-idxd], predict(lin_d, Xd[-idxd, ]))$r2,
+           metrics(yd[-idxd], predict(rf_d, Xd[-idxd, ]))$r2),
+    mae = c(metrics(yd[-idxd], predict(lin_d, Xd[-idxd, ]))$mae,
+            metrics(yd[-idxd], predict(rf_d, Xd[-idxd, ]))$mae),
+    rmse = c(metrics(yd[-idxd], predict(lin_d, Xd[-idxd, ]))$rmse,
+             metrics(yd[-idxd], predict(rf_d, Xd[-idxd, ]))$rmse)
   )
 } else {
-  "Not enough observations with delta_gini to model."
+  tibble()
 }
+
+delta_results
+
+metrics_tbl <- bind_rows(
+  lin_metrics %>% mutate(model = "linear_regression"),
+  rf_metrics %>% mutate(model = "random_forest"),
+  delta_results
+) %>% select(model, r2, mae, rmse)
 ```
 
 ## Clustering Profiles
@@ -304,6 +407,41 @@ if (length(feat_cols) > 0 && nrow(latest) >= 2) {
 } else {
   "Insufficient features/rows to cluster."
 }
+
+## Spatial autocorrelation (Moran's I)
+
+```{r moran}
+compute_moran_csvi <- function(df, shapes) {
+  latest_csvi <- df %>%
+    drop_na(csvi) %>%
+    group_by(country_iso) %>%
+    slice_tail(n = 1) %>%
+    ungroup()
+  merged <- shapes %>%
+    select(country_iso, geometry) %>%
+    inner_join(latest_csvi, by = "country_iso") %>%
+    drop_na(csvi)
+  if (nrow(merged) < 3) return(tibble())
+  cent <- st_centroid(merged)
+  coords <- st_coordinates(cent)
+  x <- merged$csvi
+  dist_mat <- as.matrix(dist(coords))
+  diag(dist_mat) <- NA
+  w <- 1 / (dist_mat + 1e-6)
+  w[!is.finite(w)] <- 0
+  s0 <- sum(w, na.rm = TRUE)
+  if (s0 == 0) return(tibble())
+  x_dev <- x - mean(x, na.rm = TRUE)
+  num <- sum(w * (outer(x_dev, x_dev)), na.rm = TRUE)
+  den <- sum(x_dev^2, na.rm = TRUE)
+  if (den == 0) return(tibble())
+  moran_i <- length(x_dev) / s0 * (num / den)
+  tibble(moran_i_csvi = moran_i, n_countries = length(x_dev))
+}
+
+spatial_stats <- compute_moran_csvi(data_enriched, world)
+spatial_stats
+```
 ```
 
 ## Visualizations
@@ -342,6 +480,11 @@ if (nrow(world_csvi) > 0) {
 dir.create("reports", showWarnings = FALSE, recursive = TRUE)
 write_csv(data_enriched, "reports/merged_dataset.csv")
 write_csv(feature_importance, "reports/feature_importance.csv")
+write_csv(metrics_tbl, "reports/metrics.csv")
+write_json(metrics_tbl, "reports/metrics.json", pretty = TRUE, auto_unbox = TRUE)
+if (nrow(spatial_stats) > 0) {
+  write_json(spatial_stats, "reports/spatial.json", pretty = TRUE, auto_unbox = TRUE)
+}
 ggsave("reports/stress_vs_gini.png", width = 7, height = 5)
 ggsave("reports/gini_timeseries.png", width = 9, height = 5)
 ```
