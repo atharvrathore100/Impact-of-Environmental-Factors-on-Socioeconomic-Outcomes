@@ -1,0 +1,26 @@
+---
+title: "Build LGII + Environmental Dataset"
+output: html_document
+params:
+  lgii: "data/nasa/spatialecon-lgii-measures-v1-xlsx.xlsx"
+  kaggle_dir: "data/kaggle"
+  out: "data/processed/merged.csv"
+---
+
+This R Markdown document executes the Python pipeline that merges the NASA
+LGII workbook with the Kaggle environmental rasters and writes the enriched
+CSV defined in `params`.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = TRUE, message = TRUE)
+normalize_or_passthrough <- function(path) {
+  tryCatch(
+    normalizePath(path, winslash = "/", mustWork = FALSE),
+    error = function(e) path
+  )
+}
+Sys.setenv(
+  BUILD_LGII = normalize_or_passthrough(params$lgii),
+  BUILD_KAGGLE = normalize_or_passthrough(params$kaggle_dir),
+  BUILD_OUT = normalize_or_passthrough(params$out)
+)

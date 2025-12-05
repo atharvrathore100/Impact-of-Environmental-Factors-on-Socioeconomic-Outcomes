@@ -231,6 +231,18 @@ def load_lgii_excel(path: Path | str) -> pd.DataFrame:
         "iso": "country_iso",
         "country": "country_iso",
         "gini_weighted": "gini",
+        "gini_net_index": "gini",
+        "gini_index": "gini",
     }
     df = df.rename(columns=rename_map)
+    if "gini" not in df.columns:
+        for candidate in [
+            "gini_net",
+            "gini_weighted",
+            "gini_index",
+            "gini_net_index",
+        ]:
+            if candidate in df.columns:
+                df["gini"] = df[candidate]
+                break
     return df
