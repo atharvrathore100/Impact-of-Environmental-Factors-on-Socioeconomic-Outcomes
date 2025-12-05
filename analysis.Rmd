@@ -1,8 +1,8 @@
 ---
-title: "Climate–Socioeconomic Pipeline (R)"
+title: "Climate-Socioeconomic Pipeline (R)"
 output:
-  html_document:̥
-    toc: true̥
+  html_document:
+    toc: true
     toc_depth: 2
     toc_float: true
 ---
@@ -173,8 +173,6 @@ extract_stat <- function(shapes, raster_path, fun = "mean", band = 1,
   vals <- ex[, 2]
   tibble(country_iso = shapes$country_iso, value = vals)
 }
-
-
 ```
 
 ```{r}
@@ -182,7 +180,6 @@ temp_path <- "data/Kaggle Dataset/11_temperature/World_TEMP_GISdata_LTAy_GlobalS
 print(temp_path)
 file.exists(temp_path)
 ```
-
 
 ## Environmental Features (Kaggle rasters)
 
@@ -240,17 +237,21 @@ env_static <- world %>%
   left_join({
     if (file.exists(veg_path)) {
       r <- rast(veg_path)
-      if (crs(r) != crs(world)) world_aligned <- st_transform(world, ̥crs(r)) else world_aligned <- world
+      # Align CRS to raster if needed
+      world_aligned <- if (!is.na(crs(r)) && crs(r) != st_crs(world)) st_transform(world, crs(r)) else world
       world_aligned$id <- seq_len(nrow(world_aligned))
 
-      # downsample land cover before classifying to save RAM
+      # Downsample land cover before classifying to save RAM
       r <- aggregate(r, fact = 40, fun = median, na.rm = TRUE)
 
+      # Classify to a vegetation indicator and average per country
       r_veg <- classify(
         r,
-        rbind(c(-Inf, 10, 0),
-              c(10, 200, 1),
-              c(200, Inf, 0))
+        rbind(
+          c(-Inf, 10, 0),
+          c(10, 200, 1),
+          c(200, Inf, 0)
+        )
       )
       z <- terra::zonal(r_veg, vect(world_aligned), fun = "mean", na.rm = TRUE)
       frac <- rep(NA_real_, nrow(world_aligned))
@@ -271,8 +272,10 @@ env_static <- world %>%
     precip_mm_month = NA_real_
   )
 
+```
 
-# GDP panel (1990–2015 bands)
+```{r env-extract}
+# GDP panel (1990-2015 bands)
 gdp_panel <- {
   if (file.exists(gdp_path)) {
     r <- rast(gdp_path)
@@ -336,7 +339,6 @@ data_enriched <- data_merged %>%
   ungroup()
 
 
-
 glimpse(data_enriched)
 ```
 
@@ -357,43 +359,49 @@ safe_impute <- function(v) {
   if_else(is.na(v), med, v)
 }
 
-X <- df_model %>%
-  select(any_of(features)) %>%
-  mutate(across(everything(), safe_impute))
-y <- df_model$gini
+if (nrow(df_model) >= 2) {
+  X <- df_model %>%
+    select(any_of(features)) %>%
+    mutate(across(everything(), safe_impute))
+  y <- df_model$gini
 
-# Train/test split
-set.seed(42)
-idx <- sample(seq_len(nrow(X)), size = ceiling(0.75 * nrow(X)))
-X_train <- X[idx, ]; X_test <- X[-idx, ]
-y_train <- y[idx];  y_test <- y[-idx]
+  # Train/test split
+  set.seed(42)
+  idx <- sample(seq_len(nrow(X)), size = max(1, ceiling(0.75 * nrow(X))))
+  X_train <- X[idx, ]; X_test <- X[-idx, ]
+  y_train <- y[idx];  y_test <- y[-idx]
 
-lin <- lm(y_train ~ ., data = X_train)
-lin_pred <- predict(lin, X_test)
+  lin <- lm(y_train ~ ., data = X_train)
+  lin_pred <- predict(lin, X_test)
 
-rf <- randomForest(x = X_train, y = y_train, ntree = 300, mtry = floor(sqrt(ncol(X_train))), nodesize = 2)
-rf_pred <- predict(rf, X_test)
+  rf <- randomForest(x = X_train, y = y_train, ntree = 300, mtry = floor(sqrt(ncol(X_train))), nodesize = 2)
+  rf_pred <- predict(rf, X_test)
 
-metrics <- function(truth, pred) {
-  tibble(
-    r2 = cor(truth, pred)^2,
-    mae = mean(abs(truth - pred)),
-    rmse = sqrt(mean((truth - pred)^2))
-  )
+  metrics <- function(truth, pred) {
+    tibble(
+      r2 = cor(truth, pred)^2,
+      mae = mean(abs(truth - pred)),
+      rmse = sqrt(mean((truth - pred)^2))
+    )
+  }
+
+  lin_metrics <- metrics(y_test, lin_pred)
+  rf_metrics <- metrics(y_test, rf_pred)
+
+  lin_metrics
+  rf_metrics
+
+  feature_importance <- tibble(
+    feature = colnames(rf$importance),
+    importance = as.numeric(rf$importance)
+  ) %>% arrange(desc(importance))
+
+  head(feature_importance)
+} else {
+  message("Insufficient non-NA rows to fit models.")
+  lin_metrics <- rf_metrics <- tibble(r2 = NA_real_, mae = NA_real_, rmse = NA_real_)
+  feature_importance <- tibble(feature = character(), importance = numeric())
 }
-
-lin_metrics <- metrics(y_test, lin_pred)
-rf_metrics <- metrics(y_test, rf_pred)
-
-lin_metrics
-rf_metrics
-
-feature_importance <- tibble(
-  feature = colnames(rf$importance),
-  importance = as.numeric(rf$importance)
-) %>% arrange(desc(importance))
-
-head(feature_importance)
 ```
 
 ### Delta-Gini Models
@@ -460,7 +468,7 @@ if (length(feat_cols) > 0 && nrow(latest) >= 2) {
 } else {
   "Insufficient features/rows to cluster."
 }
-
+```
 ## Spatial autocorrelation (Moran's I)
 
 ```{r moran}
@@ -475,7 +483,7 @@ compute_moran_csvi <- function(df, shapes) {
     inner_join(latest_csvi, by = "country_iso") %>%
     drop_na(csvi)
   if (nrow(merged) < 3) return(tibble())
-  cent <- st_centroid(merged)
+  cent <- st_centroid(st_geometry(merged))
   coords <- st_coordinates(cent)
   x <- merged$csvi
   dist_mat <- as.matrix(dist(coords))
@@ -522,7 +530,7 @@ if (nrow(world_csvi) > 0) {
   ggplot(world_csvi) +
     geom_sf(aes(fill = csvi), color = "gray30", size = 0.1) +
     scale_fill_viridis_c(option = "C") +
-    labs(title = "Climate–Socioeconomic Vulnerability Index (latest year)", fill = "CSVI") +
+    labs(title = "Climate-Socioeconomic Vulnerability Index (latest year)", fill = "CSVI") +
     theme(axis.text = element_blank(), axis.ticks = element_blank())
 }
 ```
