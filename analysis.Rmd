@@ -221,7 +221,7 @@ if (is.na(temp_path) || !file.exists(temp_path)) stop("Temperature raster not fo
 if (is.na(pop_path)  || !file.exists(pop_path))  stop("Population raster not found or unreadable; ensure GHS_POP...tif exists and the path is accessible.")
 ```
 
-```{r env-extract}
+```{r env-extract-1}
 env_static <- world %>%
   transmute(country_iso) %>%
   left_join(
@@ -274,7 +274,7 @@ env_static <- world %>%
 
 ```
 
-```{r env-extract}
+```{r env-extract-2}
 # GDP panel (1990-2015 bands)
 gdp_panel <- {
   if (file.exists(gdp_path)) {
@@ -470,7 +470,6 @@ if (length(feat_cols) > 0 && nrow(latest) >= 2) {
 }
 ```
 ## Spatial autocorrelation (Moran's I)
-
 ```{r moran}
 compute_moran_csvi <- function(df, shapes) {
   latest_csvi <- df %>%
