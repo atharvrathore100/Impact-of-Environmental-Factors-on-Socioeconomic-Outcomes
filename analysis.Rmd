@@ -221,7 +221,7 @@ if (is.na(temp_path) || !file.exists(temp_path)) stop("Temperature raster not fo
 if (is.na(pop_path)  || !file.exists(pop_path))  stop("Population raster not found or unreadable; ensure GHS_POP...tif exists and the path is accessible.")
 ```
 
-```{r env-extract-1}
+```{r env-extract-1, eval = !isTRUE(getOption("skip_heavy"))}
 env_static <- world %>%
   transmute(country_iso) %>%
   left_join(
